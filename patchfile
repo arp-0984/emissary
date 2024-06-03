@@ -1,0 +1,935 @@
+diff --git a/src/main/java/emissary/util/FlexibleDateTimeParser.java b/src/main/java/emissary/util/FlexibleDateTimeParser.java
+index 3886279..73834a9 100644
+--- a/src/main/java/emissary/util/FlexibleDateTimeParser.java
++++ b/src/main/java/emissary/util/FlexibleDateTimeParser.java
+@@ -13,9 +13,11 @@ import java.io.IOException;
+ import java.time.DateTimeException;
+ import java.time.LocalDate;
+ import java.time.LocalDateTime;
++import java.time.OffsetDateTime;
+ import java.time.ZoneId;
+ import java.time.ZonedDateTime;
+ import java.time.format.DateTimeFormatter;
++import java.time.format.DateTimeFormatterBuilder;
+ import java.time.format.DateTimeParseException;
+ import java.time.temporal.TemporalAccessor;
+ import java.util.ArrayList;
+@@ -35,13 +37,14 @@ import static java.util.stream.Collectors.toList;
+  * <p>
+  * Natty - It handled a good chunk of the formats but not all.
+  */
+-public class FlexibleDateTimeParser {
++public final class FlexibleDateTimeParser {
+ 
+     /* Logger */
+     private static final Logger logger = LoggerFactory.getLogger(FlexibleDateTimeParser.class);
+ 
+     /* Configuration Variables */
+-    private static final String CFG_FORMAT = "FORMAT_DATETIME";
++    private static final String CFG_FORMAT_MAIN = "FORMAT_DATETIME_MAIN";
++    private static final String CFG_FORMAT_EXTRA = "FORMAT_DATETIME_EXTRA";
+     private static final String CFG_TIMEZONE = "TIMEZONE";
+     private static final String DEFAULT_TIMEZONE = "GMT";
+     private static final String SPACE = " ";
+@@ -50,14 +53,23 @@ public class FlexibleDateTimeParser {
+     /* Remove all tabs and extra spaces */
+     private static final Pattern REPLACE = Pattern.compile("\t+|[ ]+", Pattern.DOTALL);
+ 
+-    /* Remove other junk */
+-    private static final Pattern REMOVE = Pattern.compile("<.+?>$|=0D$", Pattern.DOTALL);
++    /*
++     * Remove other junk -- anything in an html tag, all parenthesis and quotes, and any non-word characters at the
++     * beginning or end
++     */
++    private static final Pattern REMOVE = Pattern.compile("<.+?>$|=0D$|\\(|\\)|\"|\\[|]|\\W+$|^\\W+", Pattern.DOTALL);
++
++    private static final Pattern PHT_REPLACE = Pattern.compile("PHT");
++    private static final String PT_TIMEZONE = "PT";
+ 
+     /* timezone - config var: TIMEZONE */
+     private static ZoneId timezone = ZoneId.of(DEFAULT_TIMEZONE);
+ 
+-    /* date time formats - vars: FORMAT_DATETIME */
+-    private static List<DateTimeFormatter> dateFormats = new ArrayList<>();
++    /* date time formats - vars: FORMAT_DATETIME_MAIN */
++    private static List<DateTimeFormatter> dateFormatsMain = new ArrayList<>();
++
++    /* Extra date time formats - lits to try if our main list has failed - vars: FORMAT_DATETIME_EXTRA */
++    private static List<DateTimeFormatter> dateFormatsExtra = new ArrayList<>();
+ 
+     /* init */
+     static {
+@@ -74,13 +86,27 @@ public class FlexibleDateTimeParser {
+     }
+ 
+     /**
+-     * Attempts to parse a string date using pre-configured patterns
++     * Attempts to parse a string date using pre-configured patterns. Default not trying the extensive date/time format list
+      *
+      * @param dateString the string to parse
+      * @return the parsed immutable and thread-safe zoned-date, or null if it failed to parse
+      */
+     public static ZonedDateTime parse(final String dateString) {
+-        return parse(dateString, dateFormats);
++        return parse(dateString, false);
++    }
++
++    /**
++     * Attempts to parse a string date using pre-configured patterns
++     *
++     * @param dateString the string to parse
++     * @param tryExtensiveFormatList True if we want to try out complete list of date/time formats False if we only want to
++     *        attempt the most common date/time formats
++     * @return the parsed immutable and thread-safe zoned-date, or null if it failed to parse
++     */
++    public static ZonedDateTime parse(final String dateString, boolean tryExtensiveFormatList) {
++        ZonedDateTime zdt = parse(dateString, dateFormatsMain);
++
++        return zdt == null && tryExtensiveFormatList ? parse(dateString, dateFormatsExtra) : zdt;
+     }
+ 
+     /**
+@@ -116,9 +142,12 @@ public class FlexibleDateTimeParser {
+ 
+             try {
+                 // try for a zoned date (has timezone), local date time (no time zone), or just a local date (no time)
+-                TemporalAccessor accessor = formatter.parseBest(cleanedDateString, ZonedDateTime::from, LocalDateTime::from, LocalDate::from);
++                TemporalAccessor accessor =
++                        formatter.parseBest(cleanedDateString, ZonedDateTime::from, OffsetDateTime::from, LocalDateTime::from, LocalDate::from);
+                 if (accessor instanceof ZonedDateTime) {
+                     return (ZonedDateTime) accessor; // return the date time w/ timezone
++                } else if (accessor instanceof OffsetDateTime) {
++                    return ((OffsetDateTime) accessor).atZoneSameInstant(timezone);
+                 } else if (accessor instanceof LocalDateTime) {
+                     return ((LocalDateTime) accessor).atZone(timezone); // set the timezone
+                 } else if (accessor instanceof LocalDate) {
+@@ -143,7 +172,7 @@ public class FlexibleDateTimeParser {
+             // fire up the configurator
+             Configurator configurator = ConfigUtil.getConfigInfo(FlexibleDateTimeParser.class);
+             setupTimezone(configurator.findStringEntry(CFG_TIMEZONE, DEFAULT_TIMEZONE));
+-            setupDateFormats(configurator.findStringMatchEntries(CFG_FORMAT));
++            setupDateFormats(configurator.findStringMatchEntries(CFG_FORMAT_MAIN), configurator.findStringMatchEntries(CFG_FORMAT_EXTRA));
+         } catch (IOException e) {
+             throw new IllegalArgumentException("Could not configure parser!!", e);
+         }
+@@ -170,13 +199,23 @@ public class FlexibleDateTimeParser {
+     /**
+      * Override the default date formats
+      *
+-     * @param configEntries the list of override formats from the config file
++     * @param configEntriesMain the list of main override formats from the config file
++     * @param configEntriesExtra the list of extra override formats from the config file
+      */
+-    private static void setupDateFormats(final List<ConfigEntry> configEntries) {
+-        List<DateTimeFormatter> dateTimeFormats = getConfigFormats(configEntries);
+-        if (CollectionUtils.isNotEmpty(dateTimeFormats)) {
+-            dateFormats = Collections.unmodifiableList(dateTimeFormats);
+-            logger.debug("Created successfully. Created {} of {} formats from config", dateFormats.size(), configEntries.size());
++    private static void setupDateFormats(final List<ConfigEntry> configEntriesMain, final List<ConfigEntry> configEntriesExtra) {
++        List<DateTimeFormatter> dateTimeFormatsMain = getConfigFormats(configEntriesMain);
++        if (CollectionUtils.isNotEmpty(dateTimeFormatsMain)) {
++            dateFormatsMain = Collections.unmodifiableList(dateTimeFormatsMain);
++            logger.debug("Created successfully. Created {} of {} formats from config", dateFormatsMain.size(), configEntriesMain.size());
++        } else {
++            logger.error("Could not create with configured variables");
++            throw new IllegalArgumentException("No date/time formats configured!!");
++        }
++
++        List<DateTimeFormatter> dateTimeFormatsExtra = getConfigFormats(configEntriesExtra);
++        if (CollectionUtils.isNotEmpty(dateTimeFormatsExtra)) {
++            dateFormatsExtra = Collections.unmodifiableList(dateTimeFormatsExtra);
++            logger.debug("Created successfully. Created {} of {} formats from config", dateFormatsExtra.size(), configEntriesExtra.size());
+         } else {
+             logger.error("Could not create with configured variables");
+             throw new IllegalArgumentException("No date/time formats configured!!");
+@@ -206,7 +245,7 @@ public class FlexibleDateTimeParser {
+     @Nullable
+     private static DateTimeFormatter getFormatter(ConfigEntry entry) {
+         try {
+-            return DateTimeFormatter.ofPattern(entry.getValue());
++            return new DateTimeFormatterBuilder().parseCaseInsensitive().appendPattern(entry.getValue()).toFormatter();
+         } catch (IllegalArgumentException e) {
+             // log the bad one and move on because there could be other possible patterns
+             logger.error("Error parsing pattern [{}]: {}", entry.getValue(), e.getLocalizedMessage());
+@@ -229,6 +268,13 @@ public class FlexibleDateTimeParser {
+         String cleanedDateString = StringUtils.substring(date, 0, 100);
+         cleanedDateString = REPLACE.matcher(cleanedDateString).replaceAll(SPACE);
+         cleanedDateString = REMOVE.matcher(cleanedDateString).replaceAll(EMPTY);
++
++        // PHT does not appear to be a valid time zone in java, but is included in the IANA timezone list. If PHT is in
++        // a date string, we get an exception. This was the only information I could find about this issue online -
++        // it suggests "PT" is the valid Philippines time zone in java:
++        // https://stackoverflow.com/questions/70605148/why-is-the-short-display-name-for-asia-manila-timezone-pt-in-java
++        cleanedDateString = PHT_REPLACE.matcher(cleanedDateString).replaceAll(PT_TIMEZONE);
++
+         return StringUtils.trimToNull(cleanedDateString);
+     }
+ 
+diff --git a/src/main/resources/emissary/util/FlexibleDateTimeParser.cfg b/src/main/resources/emissary/util/FlexibleDateTimeParser.cfg
+index 6dc6587..ce5fb16 100644
+--- a/src/main/resources/emissary/util/FlexibleDateTimeParser.cfg
++++ b/src/main/resources/emissary/util/FlexibleDateTimeParser.cfg
+@@ -1,24 +1,350 @@
+ # timezone GMT or UTC or +0000 or +00:00
+ TIMEZONE = "GMT"
+ 
+-# Formatter Types
+-
+-FORMAT_DATETIME = "yyyy-M-d[['T'][ ][/]H[:][/]m[:s][[.]SSS][ ][z][ ][Z][X]]"
+-FORMAT_DATETIME = "[E[,][ ]]d[ ]MMM[,][ ]yy[ H:mm[:ss][ ][z][ ][Z]]"
+-FORMAT_DATETIME = "[E[,][ ]]d MMM yyyy K:mm:ss a[ ][z][ ][Z]"
+-FORMAT_DATETIME = "[E[,][ ]]d[ ]MMM[.][,][ ]yyyy[ H:mm[:ss][ ][a][ ][z][ ][Z][ ][[(]z[)]]]"
+-FORMAT_DATETIME = "[E[,][ ]]MMM d[,] yyyy[,] K:mm[:ss] a"
+-FORMAT_DATETIME = "[E[,][ ]]MMM d[,] yyyy[[,] H:mm[:ss][ ][a][ ][z][ ][Z]]"
+-FORMAT_DATETIME = "[E[,][ ]]dd-MMM-yyyy[ H:mm:ss[ ][z][ ][Z]]"
+-FORMAT_DATETIME = "[E[,][ ]]MMM d H:mm[:ss][ z] yyyy"
+-FORMAT_DATETIME = "M/d/yy[ ]K:mm[:ss][ ]a"
+-FORMAT_DATETIME = "M/d/yy[ ]H:mm[:ss][ ][a][ ][z][ ][Z]"
+-FORMAT_DATETIME = "[HHmm]dd[-][.][/]MM[-][.][/]yyyy"
+-FORMAT_DATETIME = "yyyy/MM/dd[[ ]HH[:]mm[[:]ss[[.]S]][ ][z][ ][Z]]"
+-FORMAT_DATETIME = "yyyy:MM:dd[ H:m[:ss[.S]][ ][z][ ][Z]]"
+-FORMAT_DATETIME = "yyyyMMddHHmmss"
+-FORMAT_DATETIME = "yyyyMMdd"
+-FORMAT_DATETIME = "yyyyDDDHHmmss"
+-FORMAT_DATETIME = "yyyyDDDHHmm"
+-FORMAT_DATETIME = "yyyyDDD"
+-FORMAT_DATETIME = "yyyy-DDD"
++# What we're dong here is that we have a base set of patterns "FORMAT_DATETIME_MAIN" that cover most of the cases.
++# The "FORMAT_DATETIME_EXTRA" patterns cover edge cases, since the dates given to the DateTimeFormatter must exactly
++# match the provided patterns. The idea is to try all of the main patterns first, and if they all fail, attempt the extra
++# patterns.
++# I tried to keep this as organized as possible - each pattern containing offsets is repeated 7 times to cover the most
++# likely combinations of the following:
++# z = short non-location Format (PDT)
++# Z = ISO basic format with hours, minutes (-0800)
++# X = ISO basic format with hours (-08)
++
++# Additionally, each pattern containing days of the week (DOW) and the month are repeated 4 times to cover combinations
++# of the short and long forms of the days of the week
++# E = DOW short form (Mon)
++# EEEE = DOW long form (Monday)
++# MMM = Month short form (Jan)
++# MMMM = Month long form (January)
++
++# I attempted to have longer patterns that contained more optional offsets instead of separate patterns with more combinations,
++# but this became too complicated and I encountered issues with some strings not being parsed correctly
++
++# yyyyMMddTHHmmssSSSX
++FORMAT_DATETIME_EXTRA = "yyyy-M-d[['T'][ ][/]H[:][/]m[:s][[.]SSSSSSSS][ ][z][ ][Z][X]]"
++FORMAT_DATETIME_EXTRA = "yyyy-M-d[['T'][ ][/]H[:][/]m[:s][[.]SSSSSSS][ ][z][ ][Z][X]]"
++FORMAT_DATETIME_EXTRA = "yyyy-M-d[['T'][ ][/]H[:][/]m[:s][[.]SSSSSS][ ][z][ ][Z][X]]"
++FORMAT_DATETIME_EXTRA = "yyyy-M-d[['T'][ ][/]H[:][/]m[:s][[.]SSSSS][ ][z][ ][Z][X]]"
++FORMAT_DATETIME_EXTRA = "yyyy-M-d[['T'][ ][/]H[:][/]m[:s][[.]SSSS][ ][z][ ][Z][X]]"
++FORMAT_DATETIME_MAIN = "yyyy-M-d[['T'][ ][/]H[:][/]m[:s][[.]SSS][ ][z][ ][Z][X]]"
++FORMAT_DATETIME_EXTRA = "yyyy-M-d[['T'][ ][/]H[:][/]m[:s][[.]SS][ ][z][ ][Z][X]]"
++FORMAT_DATETIME_EXTRA = "yyyy-M-d[['T'][ ][/]H[:][/]m[:s][[.]S][ ][z][ ][Z][X]]"
++
++
++# EdMMMyyHmmssZ
++# DOW day month 2-digit year timestamp offsets
++FORMAT_DATETIME_MAIN = "[E[,][ ]]d[ ]MMM[,][ ]yy[ H:mm[:ss][ ][z][ ][Z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d[ ]MMM[,][ ]yy[ H:mm[:ss][ ][z][ ][z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d[ ]MMM[,][ ]yy[ H:mm[:ss][ ][z][ ][Z][ ][z]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d[ ]MMM[,][ ]yy[ H:mm[:ss][ ][z][ ][Z][ ][X]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d[ ]MMM[,][ ]yy[ H:mm[:ss][ ][Z][ ][z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d[ ]MMM[,][ ]yy[ H:mm[:ss][ ][Z][ ][X]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d[ ]MMM[,][ ]yy[ H:mm[:ss][ ][X][ ][z][ ][Z]]"
++
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d[ ]MMM[,][ ]yy[ H:mm[:ss][ ][z][ ][Z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d[ ]MMM[,][ ]yy[ H:mm[:ss][ ][z][ ][z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d[ ]MMM[,][ ]yy[ H:mm[:ss][ ][z][ ][Z][ ][z]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d[ ]MMM[,][ ]yy[ H:mm[:ss][ ][z][ ][Z][ ][X]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d[ ]MMM[,][ ]yy[ H:mm[:ss][ ][Z][ ][z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d[ ]MMM[,][ ]yy[ H:mm[:ss][ ][Z][ ][X]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d[ ]MMM[,][ ]yy[ H:mm[:ss][ ][X][ ][z][ ][Z]]"
++
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d[ ]MMMM[,][ ]yy[ H:mm[:ss][ ][z][ ][Z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d[ ]MMMM[,][ ]yy[ H:mm[:ss][ ][z][ ][z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d[ ]MMMM[,][ ]yy[ H:mm[:ss][ ][z][ ][Z][ ][z]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d[ ]MMMM[,][ ]yy[ H:mm[:ss][ ][z][ ][Z][ ][X]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d[ ]MMMM[,][ ]yy[ H:mm[:ss][ ][Z][ ][z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d[ ]MMMM[,][ ]yy[ H:mm[:ss][ ][Z][ ][X]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d[ ]MMMM[,][ ]yy[ H:mm[:ss][ ][X][ ][z][ ][Z]]"
++
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d[ ]MMMM[,][ ]yy[ H:mm[:ss][ ][z][ ][Z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d[ ]MMMM[,][ ]yy[ H:mm[:ss][ ][z][ ][z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d[ ]MMMM[,][ ]yy[ H:mm[:ss][ ][z][ ][Z][ ][z]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d[ ]MMMM[,][ ]yy[ H:mm[:ss][ ][z][ ][Z][ ][X]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d[ ]MMMM[,][ ]yy[ H:mm[:ss][ ][Z][ ][z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d[ ]MMMM[,][ ]yy[ H:mm[:ss][ ][Z][ ][X]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d[ ]MMMM[,][ ]yy[ H:mm[:ss][ ][X][ ][z][ ][Z]]"
++
++
++# EdMMMyyyyKmmssaZ
++# DOW day month year AM/PM timestamp offset
++FORMAT_DATETIME_MAIN = "[E[,][ ]]d MMM yyyy K:mm:ss a[ ][z][ ][Z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d MMM yyyy K:mm:ss a[ ][z][ ][z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d MMM yyyy K:mm:ss a[ ][z][ ][Z][ ][z]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d MMM yyyy K:mm:ss a[ ][z][ ][Z][ ][X]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d MMM yyyy K:mm:ss a[ ][Z][ ][z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d MMM yyyy K:mm:ss a[ ][Z][ ][X]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d MMM yyyy K:mm:ss a[ ][X][ ][z][ ][Z]"
++
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d MMM yyyy K:mm:ss a[ ][z][ ][Z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d MMM yyyy K:mm:ss a[ ][z][ ][z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d MMM yyyy K:mm:ss a[ ][z][ ][Z][ ][z]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d MMM yyyy K:mm:ss a[ ][z][ ][Z][ ][X]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d MMM yyyy K:mm:ss a[ ][Z][ ][z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d MMM yyyy K:mm:ss a[ ][Z][ ][X]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d MMM yyyy K:mm:ss a[ ][X][ ][z][ ][Z]"
++
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d MMMM yyyy K:mm:ss a[ ][z][ ][Z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d MMMM yyyy K:mm:ss a[ ][z][ ][z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d MMMM yyyy K:mm:ss a[ ][z][ ][Z][ ][z]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d MMMM yyyy K:mm:ss a[ ][z][ ][Z][ ][X]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d MMMM yyyy K:mm:ss a[ ][Z][ ][z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d MMMM yyyy K:mm:ss a[ ][Z][ ][X]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d MMMM yyyy K:mm:ss a[ ][X][ ][z][ ][Z]"
++
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d MMMM yyyy K:mm:ss a[ ][z][ ][Z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d MMMM yyyy K:mm:ss a[ ][z][ ][z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d MMMM yyyy K:mm:ss a[ ][z][ ][Z][ ][z]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d MMMM yyyy K:mm:ss a[ ][z][ ][Z][ ][X]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d MMMM yyyy K:mm:ss a[ ][Z][ ][z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d MMMM yyyy K:mm:ss a[ ][Z][ ][X]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d MMMM yyyy K:mm:ss a[ ][X][ ][z][ ][Z]"
++
++
++# EdMMMyyyyHmmssZz
++# DOW day month year timestamp offset
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d[ ]MMM[.][,][ ]yyyy[ H:mm[:ss][ ][a][ ][z][ ][Z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d[ ]MMM[.][,][ ]yyyy[ H:mm[:ss][ ][a][ ][z][ ][z][ ][Z]]"
++FORMAT_DATETIME_MAIN = "[E[,][ ]]d[ ]MMM[.][,][ ]yyyy[ H:mm[:ss][ ][a][ ][z][ ][Z][ ][z]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d[ ]MMM[.][,][ ]yyyy[ H:mm[:ss][ ][a][ ][z][ ][Z][ ][X]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d[ ]MMM[.][,][ ]yyyy[ H:mm[:ss][ ][a][ ][Z][ ][z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d[ ]MMM[.][,][ ]yyyy[ H:mm[:ss][ ][a][ ][Z][ ][X]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d[ ]MMM[.][,][ ]yyyy[ H:mm[:ss][ ][a][ ][X][ ][z][ ][Z]]"
++
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d[ ]MMM[.][,][ ]yyyy[ H:mm[:ss][ ][a][ ][z][ ][Z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d[ ]MMM[.][,][ ]yyyy[ H:mm[:ss][ ][a][ ][z][ ][z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d[ ]MMM[.][,][ ]yyyy[ H:mm[:ss][ ][a][ ][z][ ][Z][ ][z]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d[ ]MMM[.][,][ ]yyyy[ H:mm[:ss][ ][a][ ][z][ ][Z][ ][X]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d[ ]MMM[.][,][ ]yyyy[ H:mm[:ss][ ][a][ ][Z][ ][z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d[ ]MMM[.][,][ ]yyyy[ H:mm[:ss][ ][a][ ][Z][ ][X]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d[ ]MMM[.][,][ ]yyyy[ H:mm[:ss][ ][a][ ][X][ ][z][ ][Z]]"
++
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d[ ]MMMM[.][,][ ]yyyy[ H:mm[:ss][ ][a][ ][z][ ][Z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d[ ]MMMM[.][,][ ]yyyy[ H:mm[:ss][ ][a][ ][z][ ][z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d[ ]MMMM[.][,][ ]yyyy[ H:mm[:ss][ ][a][ ][z][ ][Z][ ][z]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d[ ]MMMM[.][,][ ]yyyy[ H:mm[:ss][ ][a][ ][z][ ][Z][ ][X]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d[ ]MMMM[.][,][ ]yyyy[ H:mm[:ss][ ][a][ ][Z][ ][z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d[ ]MMMM[.][,][ ]yyyy[ H:mm[:ss][ ][a][ ][Z][ ][X]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]d[ ]MMMM[.][,][ ]yyyy[ H:mm[:ss][ ][a][ ][X][ ][z][ ][Z]]"
++
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d[ ]MMMM[.][,][ ]yyyy[ H:mm[:ss][ ][a][ ][z][ ][Z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d[ ]MMMM[.][,][ ]yyyy[ H:mm[:ss][ ][a][ ][z][ ][z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d[ ]MMMM[.][,][ ]yyyy[ H:mm[:ss][ ][a][ ][z][ ][Z][ ][z]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d[ ]MMMM[.][,][ ]yyyy[ H:mm[:ss][ ][a][ ][z][ ][Z][ ][X]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d[ ]MMMM[.][,][ ]yyyy[ H:mm[:ss][ ][a][ ][Z][ ][z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d[ ]MMMM[.][,][ ]yyyy[ H:mm[:ss][ ][a][ ][Z][ ][X]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]d[ ]MMMM[.][,][ ]yyyy[ H:mm[:ss][ ][a][ ][X][ ][z][ ][Z]]"
++
++
++# EMMMdyyyyHmmssz
++# DOW month day year timestamp offset
++FORMAT_DATETIME_MAIN = "[E[,][ ]]MMM d[,] yyyy[[,] H:mm[:ss][ ][a][ ][z][ ][Z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMM d[,] yyyy[[,] H:mm[:ss][ ][a][ ][z][ ][z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMM d[,] yyyy[[,] H:mm[:ss][ ][a][ ][z][ ][Z][ ][z]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMM d[,] yyyy[[,] H:mm[:ss][ ][a][ ][z][ ][Z][ ][X]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMM d[,] yyyy[[,] H:mm[:ss][ ][a][ ][Z][ ][z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMM d[,] yyyy[[,] H:mm[:ss][ ][a][ ][Z][ ][X]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMM d[,] yyyy[[,] H:mm[:ss][ ][a][ ][X][ ][z][ ][Z]]"
++
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMM d[,] yyyy[[,] H:mm[:ss][ ][a][ ][z][ ][Z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMM d[,] yyyy[[,] H:mm[:ss][ ][a][ ][z][ ][z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMM d[,] yyyy[[,] H:mm[:ss][ ][a][ ][z][ ][Z][ ][z]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMM d[,] yyyy[[,] H:mm[:ss][ ][a][ ][z][ ][Z][ ][X]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMM d[,] yyyy[[,] H:mm[:ss][ ][a][ ][Z][ ][z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMM d[,] yyyy[[,] H:mm[:ss][ ][a][ ][Z][ ][X]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMM d[,] yyyy[[,] H:mm[:ss][ ][a][ ][X][ ][z][ ][Z]]"
++
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMMM d[,] yyyy[[,] H:mm[:ss][ ][a][ ][z][ ][Z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMMM d[,] yyyy[[,] H:mm[:ss][ ][a][ ][z][ ][z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMMM d[,] yyyy[[,] H:mm[:ss][ ][a][ ][z][ ][Z][ ][z]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMMM d[,] yyyy[[,] H:mm[:ss][ ][a][ ][z][ ][Z][ ][X]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMMM d[,] yyyy[[,] H:mm[:ss][ ][a][ ][Z][ ][z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMMM d[,] yyyy[[,] H:mm[:ss][ ][a][ ][Z][ ][X]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMMM d[,] yyyy[[,] H:mm[:ss][ ][a][ ][X][ ][z][ ][Z]]"
++
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMMM d[,] yyyy[[,] H:mm[:ss][ ][a][ ][z][ ][Z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMMM d[,] yyyy[[,] H:mm[:ss][ ][a][ ][z][ ][z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMMM d[,] yyyy[[,] H:mm[:ss][ ][a][ ][z][ ][Z][ ][z]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMMM d[,] yyyy[[,] H:mm[:ss][ ][a][ ][z][ ][Z][ ][X]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMMM d[,] yyyy[[,] H:mm[:ss][ ][a][ ][Z][ ][z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMMM d[,] yyyy[[,] H:mm[:ss][ ][a][ ][Z][ ][X]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMMM d[,] yyyy[[,] H:mm[:ss][ ][a][ ][X][ ][z][ ][Z]]"
++
++
++# EMMMdyyyyKmma
++# DOW month day year AM/PM timestamp offset
++FORMAT_DATETIME_MAIN = "[E[,][ ]]MMM d[,] yyyy[,] K:mm[:ss] a[ ][z][ ][Z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMM d[,] yyyy[,] K:mm[:ss] a[ ][z][ ][z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMM d[,] yyyy[,] K:mm[:ss] a[ ][z][ ][Z][ ][z]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMM d[,] yyyy[,] K:mm[:ss] a[ ][z][ ][Z][ ][X]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMM d[,] yyyy[,] K:mm[:ss] a[ ][Z][ ][z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMM d[,] yyyy[,] K:mm[:ss] a[ ][Z][ ][X]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMM d[,] yyyy[,] K:mm[:ss] a[ ][X][ ][z][ ][Z]"
++
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMM d[,] yyyy[,] K:mm[:ss] a[ ][z][ ][Z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMM d[,] yyyy[,] K:mm[:ss] a[ ][z][ ][z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMM d[,] yyyy[,] K:mm[:ss] a[ ][z][ ][Z][ ][z]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMM d[,] yyyy[,] K:mm[:ss] a[ ][z][ ][Z][ ][X]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMM d[,] yyyy[,] K:mm[:ss] a[ ][Z][ ][z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMM d[,] yyyy[,] K:mm[:ss] a[ ][Z][ ][X]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMM d[,] yyyy[,] K:mm[:ss] a[ ][X][ ][z][ ][Z]"
++
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMMM d[,] yyyy[,] K:mm[:ss] a[ ][z][ ][Z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMMM d[,] yyyy[,] K:mm[:ss] a[ ][z][ ][z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMMM d[,] yyyy[,] K:mm[:ss] a[ ][z][ ][Z][ ][z]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMMM d[,] yyyy[,] K:mm[:ss] a[ ][z][ ][Z][ ][X]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMMM d[,] yyyy[,] K:mm[:ss] a[ ][Z][ ][z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMMM d[,] yyyy[,] K:mm[:ss] a[ ][Z][ ][X]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMMM d[,] yyyy[,] K:mm[:ss] a[ ][X][ ][z][ ][Z]"
++
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMMM d[,] yyyy[,] K:mm[:ss] a[ ][z][ ][Z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMMM d[,] yyyy[,] K:mm[:ss] a[ ][z][ ][z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMMM d[,] yyyy[,] K:mm[:ss] a[ ][z][ ][Z][ ][z]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMMM d[,] yyyy[,] K:mm[:ss] a[ ][z][ ][Z][ ][X]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMMM d[,] yyyy[,] K:mm[:ss] a[ ][Z][ ][z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMMM d[,] yyyy[,] K:mm[:ss] a[ ][Z][ ][X]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMMM d[,] yyyy[,] K:mm[:ss] a[ ][X][ ][z][ ][Z]"
++
++
++# EddMMMyyyyHmmssZ
++# DOW day-month-year timestamp offset
++FORMAT_DATETIME_MAIN = "[E[,][ ]]dd-MMM-yyyy[ H:mm:ss[ ][z][ ][Z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]dd-MMM-yyyy[ H:mm:ss[ ][z][ ][z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]dd-MMM-yyyy[ H:mm:ss[ ][z][ ][Z][ ][z]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]dd-MMM-yyyy[ H:mm:ss[ ][z][ ][Z][ ][X]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]dd-MMM-yyyy[ H:mm:ss[ ][Z][ ][z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]dd-MMM-yyyy[ H:mm:ss[ ][Z][ ][X]]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]dd-MMM-yyyy[ H:mm:ss[ ][X][ ][z][ ][Z]]"
++
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]dd-MMM-yyyy[ H:mm:ss[ ][z][ ][Z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]dd-MMM-yyyy[ H:mm:ss[ ][z][ ][z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]dd-MMM-yyyy[ H:mm:ss[ ][z][ ][Z][ ][z]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]dd-MMM-yyyy[ H:mm:ss[ ][z][ ][Z][ ][X]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]dd-MMM-yyyy[ H:mm:ss[ ][Z][ ][z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]dd-MMM-yyyy[ H:mm:ss[ ][Z][ ][X]]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]dd-MMM-yyyy[ H:mm:ss[ ][X][ ][z][ ][Z]]"
++
++
++# EMMMdHHmmsszzzyyyy
++# Year is after the timestamp
++# DOW month day timestamp offset year offset
++FORMAT_DATETIME_MAIN = "[E[,][ ]]MMM d[,] H:mm[:ss][ z] yyyy[ ][z][ ][Z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMM d[,] H:mm[:ss][ z] yyyy[ ][z][ ][z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMM d[,] H:mm[:ss][ z] yyyy[ ][z][ ][Z][ ][z]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMM d[,] H:mm[:ss][ z] yyyy[ ][z][ ][Z][ ][X]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMM d[,] H:mm[:ss][ z] yyyy[ ][Z][ ][z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMM d[,] H:mm[:ss][ z] yyyy[ ][Z][ ][X]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMM d[,] H:mm[:ss][ z] yyyy[ ][X][ ][z][ ][Z]"
++
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMM d[,] H:mm[:ss][ z] yyyy[ ][z][ ][Z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMM d[,] H:mm[:ss][ z] yyyy[ ][z][ ][z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMM d[,] H:mm[:ss][ z] yyyy[ ][z][ ][Z][ ][z]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMM d[,] H:mm[:ss][ z] yyyy[ ][z][ ][Z][ ][X]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMM d[,] H:mm[:ss][ z] yyyy[ ][Z][ ][z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMM d[,] H:mm[:ss][ z] yyyy[ ][Z][ ][X]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMM d[,] H:mm[:ss][ z] yyyy[ ][X][ ][z][ ][Z]"
++
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMMM d[,] H:mm[:ss][ z] yyyy[ ][z][ ][Z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMMM d[,] H:mm[:ss][ z] yyyy[ ][z][ ][z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMMM d[,] H:mm[:ss][ z] yyyy[ ][z][ ][Z][ ][z]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMMM d[,] H:mm[:ss][ z] yyyy[ ][z][ ][Z][ ][X]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMMM d[,] H:mm[:ss][ z] yyyy[ ][Z][ ][z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMMM d[,] H:mm[:ss][ z] yyyy[ ][Z][ ][X]"
++FORMAT_DATETIME_EXTRA = "[EEEE[,][ ]]MMMM d[,] H:mm[:ss][ z] yyyy[ ][X][ ][z][ ][Z]"
++
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMMM d[,] H:mm[:ss][ z] yyyy[ ][z][ ][Z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMMM d[,] H:mm[:ss][ z] yyyy[ ][z][ ][z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMMM d[,] H:mm[:ss][ z] yyyy[ ][z][ ][Z][ ][z]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMMM d[,] H:mm[:ss][ z] yyyy[ ][z][ ][Z][ ][X]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMMM d[,] H:mm[:ss][ z] yyyy[ ][Z][ ][z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMMM d[,] H:mm[:ss][ z] yyyy[ ][Z][ ][X]"
++FORMAT_DATETIME_EXTRA = "[E[,][ ]]MMMM d[,] H:mm[:ss][ z] yyyy[ ][X][ ][z][ ][Z]"
++
++
++# MdyyKmma
++FORMAT_DATETIME_MAIN = "M/d/yy[ ]K:mm[:ss][ ]a"
++
++
++# MdyyHmmssaz
++FORMAT_DATETIME_MAIN = "M/d/yy[ ]H:mm[:ss][ ][a][ ][z][ ][Z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "M/d/yy[ ]H:mm[:ss][ ][a][ ][z][ ][z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "M/d/yy[ ]H:mm[:ss][ ][a][ ][z][ ][Z][ ][z]"
++FORMAT_DATETIME_EXTRA = "M/d/yy[ ]H:mm[:ss][ ][a][ ][z][ ][Z][ ][X]"
++FORMAT_DATETIME_EXTRA = "M/d/yy[ ]H:mm[:ss][ ][a][ ][Z][ ][z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "M/d/yy[ ]H:mm[:ss][ ][a][ ][Z][ ][X]"
++FORMAT_DATETIME_EXTRA = "M/d/yy[ ]H:mm[:ss][ ][a][ ][X][ ][z][ ][Z]"
++
++
++# MdyyyyKmma
++FORMAT_DATETIME_MAIN = "M/d/yyyy[ ]K:mm[:ss][ ]a"
++
++
++# MdyyyyHmmssaz
++FORMAT_DATETIME_MAIN = "M/d/yyyy[ ]H:mm[:ss][ ][a][ ][z][ ][Z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "M/d/yyyy[ ]H:mm[:ss][ ][a][ ][z][ ][z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "M/d/yyyy[ ]H:mm[:ss][ ][a][ ][z][ ][Z][ ][z]"
++FORMAT_DATETIME_EXTRA = "M/d/yyyy[ ]H:mm[:ss][ ][a][ ][z][ ][Z][ ][X]"
++FORMAT_DATETIME_EXTRA = "M/d/yyyy[ ]H:mm[:ss][ ][a][ ][Z][ ][z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "M/d/yyyy[ ]H:mm[:ss][ ][a][ ][Z][ ][X]"
++FORMAT_DATETIME_EXTRA = "M/d/yyyy[ ]H:mm[:ss][ ][a][ ][X][ ][z][ ][Z]"
++
++
++# dMyyyKmmssa
++FORMAT_DATETIME_MAIN = "d.M.yyyy[ ]K:mm[:ss][ ]a"
++
++
++# dMyyyHmmssaz
++FORMAT_DATETIME_MAIN = "d.M.yyyy[ ]H:mm[:ss][ ][a][ ][z][ ][Z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "d.M.yyyy[ ]H:mm[:ss][ ][a][ ][z][ ][z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "d.M.yyyy[ ]H:mm[:ss][ ][a][ ][z][ ][Z][ ][z]"
++FORMAT_DATETIME_EXTRA = "d.M.yyyy[ ]H:mm[:ss][ ][a][ ][z][ ][Z][ ][X]"
++FORMAT_DATETIME_EXTRA = "d.M.yyyy[ ]H:mm[:ss][ ][a][ ][Z][ ][z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "d.M.yyyy[ ]H:mm[:ss][ ][a][ ][Z][ ][X]"
++FORMAT_DATETIME_EXTRA = "d.M.yyyy[ ]H:mm[:ss][ ][a][ ][X][ ][z][ ][Z]"
++
++
++# HHmmddMMyyyy
++FORMAT_DATETIME_MAIN = "[HHmm]dd[-][.][/]MM[-][.][/]yyyy"
++
++# yyyyMMddHHmmssS
++FORMAT_DATETIME_MAIN = "yyyy/MM/dd[[ ]HH[:]mm[[:]ss[[.]S]][ ][z][ ][Z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "yyyy/MM/dd[[ ]HH[:]mm[[:]ss[[.]S]][ ][z][ ][z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "yyyy/MM/dd[[ ]HH[:]mm[[:]ss[[.]S]][ ][z][ ][Z][ ][z]"
++FORMAT_DATETIME_EXTRA = "yyyy/MM/dd[[ ]HH[:]mm[[:]ss[[.]S]][ ][z][ ][Z][ ][X]"
++FORMAT_DATETIME_EXTRA = "yyyy/MM/dd[[ ]HH[:]mm[[:]ss[[.]S]][ ][Z][ ][z][ ][Z]"
++FORMAT_DATETIME_EXTRA = "yyyy/MM/dd[[ ]HH[:]mm[[:]ss[[.]S]][ ][Z][ ][X]"
++FORMAT_DATETIME_EXTRA = "yyyy/MM/dd[[ ]HH[:]mm[[:]ss[[.]S]][ ][X][ ][z][ ][Z]"
++
++# yyyy_MM_ddHHmmssS
++FORMAT_DATETIME_MAIN = "yyyy:MM:dd[ H:m[:ss[.S]][ ][z][ ][Z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "yyyy:MM:dd[ H:m[:ss[.S]][ ][z][ ][z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "yyyy:MM:dd[ H:m[:ss[.S]][ ][z][ ][Z][ ][z]]"
++FORMAT_DATETIME_EXTRA = "yyyy:MM:dd[ H:m[:ss[.S]][ ][z][ ][Z][ ][X]]"
++FORMAT_DATETIME_EXTRA = "yyyy:MM:dd[ H:m[:ss[.S]][ ][Z][ ][z][ ][Z]]"
++FORMAT_DATETIME_EXTRA = "yyyy:MM:dd[ H:m[:ss[.S]][ ][Z][ ][X]]"
++FORMAT_DATETIME_EXTRA = "yyyy:MM:dd[ H:m[:ss[.S]][ ][X][ ][z][ ][Z]]"
++
++
++# yyyyMMddHHmmss
++FORMAT_DATETIME_MAIN = "yyyyMMddHHmmss"
++
++
++# yyyyMMdd
++FORMAT_DATETIME_MAIN = "yyyyMMdd"
++
++
++# yyyyDDDHHmmss
++FORMAT_DATETIME_MAIN = "yyyyDDDHHmmss"
++
++
++# yyyyDDDHHmm
++FORMAT_DATETIME_MAIN = "yyyyDDDHHmm"
++
++
++# yyyyDDD
++FORMAT_DATETIME_MAIN = "yyyyDDD"
++
++
++# yyyy_DDD
++FORMAT_DATETIME_MAIN = "yyyy-DDD"
+diff --git a/src/test/java/emissary/util/FlexibleDateTimeParserTest.java b/src/test/java/emissary/util/FlexibleDateTimeParserTest.java
+index 0638ecb..032261f 100644
+--- a/src/test/java/emissary/util/FlexibleDateTimeParserTest.java
++++ b/src/test/java/emissary/util/FlexibleDateTimeParserTest.java
+@@ -50,6 +50,43 @@ class FlexibleDateTimeParserTest extends UnitTest {
+     }
+ 
+     /**
++     * Test parsing date strings and include the extra/ more comprehensive patterns in the config file
++     *
++     * @param date the string representation of a date
++     * @param expected the expected parsed and formatted date
++     * @param msg the error message to display if the test fails
++     */
++    private static void extraPatternTest(@Nullable String date, long expected, String msg) {
++        ZonedDateTime unknownParse = FlexibleDateTimeParser.parse(date, true);
++        Assertions.assertEquals(expected, unknownParse == null ? 0L : unknownParse.toEpochSecond(), "Error on: " + msg);
++    }
++
++
++    /**
++     * Helps assist in testing all the possible offset patterns that we want to attempt to parse for a given date
++     * 
++     * @param dateString the string representation of a date
++     * @param expected the expected parsed and formatted date
++     */
++    private void testAllOffsets(String dateString, long expected) {
++        String[] offsets = {"EST-0500 -0500", // zZZ
++                "EST EST-0500", // zzZ
++                "EST-0500 EST", // zZz
++                "EST-0500 -05", // zZX
++                "-0500 EST-0500", // ZzZ
++                "-0500 -05", // ZX
++                "-05", // X
++                "-05 EST", // Xz
++                "-05 -0500", // XZ
++                "-05 (EST-0500)"}; // XzZ
++
++        for (String offset : offsets) {
++            String dateAndOffset = dateString + " " + offset;
++            extraPatternTest(dateAndOffset, expected, "Did not parse this string correctly: " + dateAndOffset);
++        }
++    }
++
++    /**
+      * Test the date string against the expected output
+      *
+      * @param date the string representation of a date
+@@ -75,7 +112,7 @@ class FlexibleDateTimeParserTest extends UnitTest {
+      */
+     @Test
+     void parseOffsetWhenThereIsAThreeLetterTimeZone() {
+-        DateTimeFormatter pattern = DateTimeFormatter.ofPattern("[E[,][ ]]d[ ]MMM[.][,][ ]yyyy[ H:mm[:ss][ ][a][ ][z][ ][Z][ ][[(]z[)]]]");
++        DateTimeFormatter pattern = DateTimeFormatter.ofPattern("[E[,][ ]]d[ ]MMM[.][,][ ]yyyy[ H:mm[:ss][ ][a][ ][z][ ][Z][ ][z]]");
+ 
+         // without offset we expect the default ZoneId
+         test("Mon, 4 Jan 2016 13:20:30 EST", EXPECTED_FULL, pattern);
+@@ -96,6 +133,60 @@ class FlexibleDateTimeParserTest extends UnitTest {
+         test("Mon, 4 Jan 2016 18:20:30 +0000 CST", EXPECTED_FULL, pattern);
+         test("Mon, 4 Jan 2016 18:20:30 +0000 ACT", EXPECTED_FULL, pattern);
+         test("Mon, 4 Jan 2016 18:20:30 +0000 BST", EXPECTED_FULL, pattern);
++
++        // test full set of short offsets to make sure DateTimeFormatter can handle them
++        // list taken from https://www.iana.org/time-zones
++        test("Mon, 4 Jan 2016 07:20:30 -1100 SST", EXPECTED_FULL, pattern);
++        test("Mon, 4 Jan 2016 08:20:30 -1000 HST", EXPECTED_FULL, pattern);
++        test("Mon, 4 Jan 2016 09:20:30 -0900 HDT", EXPECTED_FULL, pattern);
++        test("Mon, 4 Jan 2016 09:20:30 -0900 AKST", EXPECTED_FULL, pattern);
++        test("Mon, 4 Jan 2016 10:20:30 -0800 AKDT", EXPECTED_FULL, pattern);
++        test("Mon, 4 Jan 2016 10:20:30 -0800 PST", EXPECTED_FULL, pattern);
++        test("Mon, 4 Jan 2016 11:20:30 -0700 PDT", EXPECTED_FULL, pattern);
++        test("Mon, 4 Jan 2016 11:20:30 -0700 MST", EXPECTED_FULL, pattern);
++        test("Mon, 4 Jan 2016 12:20:30 -0600 MDT", EXPECTED_FULL, pattern);
++        test("Mon, 4 Jan 2016 12:20:30 -0600 CST", EXPECTED_FULL, pattern);
++        test("Mon, 4 Jan 2016 13:20:30 -0500 CDT", EXPECTED_FULL, pattern);
++        test("Mon, 4 Jan 2016 13:20:30 -0500 EST", EXPECTED_FULL, pattern);
++        test("Mon, 4 Jan 2016 13:20:30 -0500 CST", EXPECTED_FULL, pattern);
++        test("Mon, 4 Jan 2016 14:20:30 -0400 CDT", EXPECTED_FULL, pattern);
++        test("Mon, 4 Jan 2016 14:20:30 -0400 AST", EXPECTED_FULL, pattern);
++        test("Mon, 4 Jan 2016 14:50:30 -0330 NST", EXPECTED_FULL, pattern);
++        test("Mon, 4 Jan 2016 15:20:30 -0300 ADT", EXPECTED_FULL, pattern);
++        test("Mon, 4 Jan 2016 15:50:30 -0230 NDT", EXPECTED_FULL, pattern);
++        test("Mon, 4 Jan 2016 18:20:30 +0000 GMT", EXPECTED_FULL, pattern);
++        test("Mon, 4 Jan 2016 19:20:30 +0100 BST", EXPECTED_FULL, pattern);
++        test("Mon, 4 Jan 2016 18:20:30 +0000 WET", EXPECTED_FULL, pattern);
++        test("Mon, 4 Jan 2016 19:20:30 +0100 WEST", EXPECTED_FULL, pattern);
++        test("Mon, 4 Jan 2016 19:20:30 +0100 CET", EXPECTED_FULL, pattern);
++        test("Mon, 4 Jan 2016 19:20:30 +0100 WAT", EXPECTED_FULL, pattern);
++        test("Mon, 4 Jan 2016 19:20:30 +0100 IST", EXPECTED_FULL, pattern);
++        test("Mon, 4 Jan 2016 20:20:30 +0200 IST", EXPECTED_FULL, pattern);
++        test("Mon, 4 Jan 2016 20:20:30 +0200 CEST", EXPECTED_FULL, pattern);
++        test("Mon, 4 Jan 2016 20:20:30 +0200 CAT", EXPECTED_FULL, pattern);
++        test("Mon, 4 Jan 2016 20:20:30 +0200 EET", EXPECTED_FULL, pattern);
++        test("Mon, 4 Jan 2016 20:20:30 +0200 SAST", EXPECTED_FULL, pattern);
++        test("Mon, 4 Jan 2016 21:20:30 +0300 EEST", EXPECTED_FULL, pattern);
++        test("Mon, 4 Jan 2016 21:20:30 +0300 IDT", EXPECTED_FULL, pattern);
++        test("Mon, 4 Jan 2016 21:20:30 +0300 EAT", EXPECTED_FULL, pattern);
++        test("Mon, 4 Jan 2016 21:20:30 +0300 MSK", EXPECTED_FULL, pattern);
++        test("Mon, 4 Jan 2016 23:20:30 +0500 PKT", EXPECTED_FULL, pattern);
++        test("Mon, 4 Jan 2016 23:50:30 +0530 IST", EXPECTED_FULL, pattern);
++        test("Tue, 5 Jan 2016 01:20:30 +0700 WIB", EXPECTED_FULL, pattern);
++        test("Tue, 5 Jan 2016 02:20:30 +0800 AWST", EXPECTED_FULL, pattern);
++        test("Tue, 5 Jan 2016 02:20:30 +0800 CST", EXPECTED_FULL, pattern);
++        test("Tue, 5 Jan 2016 02:20:30 +0800 HKT", EXPECTED_FULL, pattern);
++        test("Tue, 5 Jan 2016 02:20:30 +0800 PHT", EXPECTED_FULL, pattern);
++        test("Tue, 5 Jan 2016 02:20:30 +0800 PT", EXPECTED_FULL, pattern);
++        test("Tue, 5 Jan 2016 02:20:30 +0800 WITA", EXPECTED_FULL, pattern);
++        test("Tue, 5 Jan 2016 03:20:30 +0900 JST", EXPECTED_FULL, pattern);
++        test("Tue, 5 Jan 2016 03:20:30 +0900 KST", EXPECTED_FULL, pattern);
++        test("Tue, 5 Jan 2016 03:20:30 +0900 WIT", EXPECTED_FULL, pattern);
++        test("Tue, 5 Jan 2016 03:50:30 +0930 ACST", EXPECTED_FULL, pattern);
++        test("Tue, 5 Jan 2016 04:50:30 +1030 ACDT", EXPECTED_FULL, pattern);
++        test("Tue, 5 Jan 2016 04:20:30 +1000 AEST", EXPECTED_FULL, pattern);
++        test("Tue, 5 Jan 2016 04:20:30 +1000 ChST", EXPECTED_FULL, pattern);
++        test("Tue, 5 Jan 2016 05:20:30 +1100 AEDT", EXPECTED_FULL, pattern);
+     }
+ 
+     /**
+@@ -146,8 +237,20 @@ class FlexibleDateTimeParserTest extends UnitTest {
+     }
+ 
+     @Test
++    void parse_yyyyMMddTHHmmssSSSX_Extra() {
++        extraPatternTest("2016-01-04T18:20:30", EXPECTED_FULL, "0 digits for fraction of a second");
++        extraPatternTest("2016-01-04T18:20:30.0", EXPECTED_FULL, "1 digit for fraction of a second");
++        extraPatternTest("2016-01-04T18:20:30.00", EXPECTED_FULL, "2 digits for fraction of a second");
++        extraPatternTest("2016-01-04T18:20:30.0000", EXPECTED_FULL, "4 digits for fraction of a second");
++        extraPatternTest("2016-01-04T18:20:30.00000", EXPECTED_FULL, "5 digits for fraction of a second");
++        extraPatternTest("2016-01-04T18:20:30.000000", EXPECTED_FULL, "6 digits for fraction of a second");
++        extraPatternTest("2016-01-04T18:20:30.0000000", EXPECTED_FULL, "7 digits for fraction of a second");
++        extraPatternTest("2016-01-04T18:20:30.00000000", EXPECTED_FULL, "8 digits for fraction of a second");
++    }
++
++    @Test
+     void parse_EdMMMyyHmmssZ() {
+-        DateTimeFormatter pattern = DateTimeFormatter.ofPattern("[E[,][ ]]d[ ]MMM[,][ ]yy[ H:mm[:ss][ ][z][ ][Z]]");
++        DateTimeFormatter pattern = DateTimeFormatter.ofPattern("[E[,][ ]]d[ ]MMM[,][ ]yy[ H:mm[:ss][ ][z][ ][Z][ ][Z]]");
+         test("Mon, 4 Jan 16 18:20:30 +0000", EXPECTED_FULL, pattern);
+         test("Mon, 4 Jan 16 18:20:30+0000", EXPECTED_FULL, pattern);
+         test("Mon, 4 Jan 16 18:20:30 GMT+0000", EXPECTED_FULL, pattern);
+@@ -167,10 +270,18 @@ class FlexibleDateTimeParserTest extends UnitTest {
+         test("4Jan16", EXPECTED_NO_TIME, pattern);
+     }
+ 
++    @Test
++    void parse_EdMMMyyHmmssZ_Extra() {
++        testAllOffsets("Mon, 4 Jan 16 13:20:30", EXPECTED_FULL);
++        testAllOffsets("Monday, 4 Jan 16 13:20:30", EXPECTED_FULL);
++        testAllOffsets("Monday, 4 January 16 13:20:30", EXPECTED_FULL);
++        testAllOffsets("Mon, 4 January 16 13:20:30", EXPECTED_FULL);
++    }
++
+ 
+     @Test
+     void parse_EdMMMyyyyKmmssaZ() {
+-        DateTimeFormatter pattern = DateTimeFormatter.ofPattern("[E[,][ ]]d MMM yyyy K:mm:ss a[ ][z][ ][Z]");
++        DateTimeFormatter pattern = DateTimeFormatter.ofPattern("[E[,][ ]]d MMM yyyy K:mm:ss a[ ][z][ ][Z][ ][Z]");
+         test("Mon, 4 Jan 2016 06:20:30 PM +0000", EXPECTED_FULL, pattern);
+         test("Mon, 4 Jan 2016 06:20:30 PM GMT+0000", EXPECTED_FULL, pattern);
+         test("Mon, 4 Jan 2016 06:20:30 PM GMT", EXPECTED_FULL, pattern);
+@@ -184,8 +295,16 @@ class FlexibleDateTimeParserTest extends UnitTest {
+     }
+ 
+     @Test
++    void parse_EdMMMyyyyKmmssaZ_Extra() {
++        testAllOffsets("Mon, 4 Jan 2016 01:20:30 PM", EXPECTED_FULL);
++        testAllOffsets("Monday, 4 Jan 2016 01:20:30 PM", EXPECTED_FULL);
++        testAllOffsets("Monday, 4 January 2016 01:20:30 PM", EXPECTED_FULL);
++        testAllOffsets("Mon, 4 January 2016 01:20:30 PM", EXPECTED_FULL);
++    }
++
++    @Test
+     void parse_EdMMMyyyyHmmssZz() {
+-        DateTimeFormatter pattern = DateTimeFormatter.ofPattern("[E[,][ ]]d[ ]MMM[.][,][ ]yyyy[ H:mm[:ss][ ][a][ ][z][ ][Z][ ][(z)]]");
++        DateTimeFormatter pattern = DateTimeFormatter.ofPattern("[E[,][ ]]d[ ]MMM[.][,][ ]yyyy[ H:mm[:ss][ ][a][ ][z][ ][Z][ ][z]]");
+         test("Mon, 4 Jan 2016 18:20:30 +0000 (Europe/Dublin)", EXPECTED_FULL, pattern);
+         test("Mon, 4 Jan 2016 18:20:30 +0000 (Zulu)", EXPECTED_FULL, pattern);
+         test("Mon, 4 Jan 2016 18:20:30 +0000 (UTC)", EXPECTED_FULL, pattern);
+@@ -225,8 +344,16 @@ class FlexibleDateTimeParserTest extends UnitTest {
+     }
+ 
+     @Test
++    void parse_EdMMMyyyyHmmssZz_Extra() {
++        testAllOffsets("Mon, 4 Jan 2016 13:20:30", EXPECTED_FULL);
++        testAllOffsets("Monday, 4 Jan 2016 13:20:30", EXPECTED_FULL);
++        testAllOffsets("Monday, 4 January 2016 13:20:30", EXPECTED_FULL);
++        testAllOffsets("Mon, 4 January 2016 13:20:30", EXPECTED_FULL);
++    }
++
++    @Test
+     void parse_EMMMdyyyyKmma() {
+-        DateTimeFormatter pattern = DateTimeFormatter.ofPattern("[E[,][ ]]MMM d[,] yyyy[,] K:mm[:ss] a");
++        DateTimeFormatter pattern = DateTimeFormatter.ofPattern("[E[,][ ]]MMM d[,] yyyy[,] K:mm[:ss] a[ ][z][ ][Z][ ][Z]");
+         test("Mon, Jan 4, 2016 06:20 PM", EXPECTED_NO_SECS, pattern);
+         test("Mon, Jan 4, 2016 6:20 PM", EXPECTED_NO_SECS, pattern);
+         test("Mon, Jan 04, 2016 06:20 PM", EXPECTED_NO_SECS, pattern);
+@@ -236,8 +363,16 @@ class FlexibleDateTimeParserTest extends UnitTest {
+     }
+ 
+     @Test
++    void parse_EMMMdyyyyKmma_Extra() {
++        testAllOffsets("Mon, Jan 4, 2016 01:20 PM", EXPECTED_NO_SECS);
++        testAllOffsets("Monday, Jan 4, 2016 01:20 PM", EXPECTED_NO_SECS);
++        testAllOffsets("Monday, January 4, 2016 01:20 PM", EXPECTED_NO_SECS);
++        testAllOffsets("Mon, January 4, 2016 01:20 PM", EXPECTED_NO_SECS);
++    }
++
++    @Test
+     void parse_EMMMdyyyyHmmssz() {
+-        DateTimeFormatter pattern = DateTimeFormatter.ofPattern("[E[,][ ]]MMM d[,] yyyy[[,] H:mm[:ss][ ][a][ ][z][ ][Z]]");
++        DateTimeFormatter pattern = DateTimeFormatter.ofPattern("[E[,][ ]]MMM d[,] yyyy[[,] H:mm[:ss][ ][a][ ][z][ ][Z][ ][Z]]");
+         test("Mon, Jan 4, 2016 18:20:30 UTC", EXPECTED_FULL, pattern);
+         test("Mon, Jan 04, 2016 18:20:30 UTC", EXPECTED_FULL, pattern);
+         test("Mon, Jan 4, 2016 13:20:30 -0500", EXPECTED_FULL, pattern);
+@@ -267,6 +402,14 @@ class FlexibleDateTimeParserTest extends UnitTest {
+     }
+ 
+     @Test
++    void parse_EMMMdyyyyHmmssz_Extra() {
++        testAllOffsets("Mon, Jan 04, 2016 13:20:30", EXPECTED_FULL);
++        testAllOffsets("Monday, Jan 04, 2016 13:20:30", EXPECTED_FULL);
++        testAllOffsets("Monday, January 04, 2016 13:20:30", EXPECTED_FULL);
++        testAllOffsets("Mon, January 04, 2016 13:20:30", EXPECTED_FULL);
++    }
++
++    @Test
+     void parse_EddMMMyyyyHmmssZ() {
+         DateTimeFormatter pattern = DateTimeFormatter.ofPattern("[E[,][ ]]dd-MMM-yyyy[ H:mm:ss[ ][z][ ][Z]]");
+         test("Mon 04-Jan-2016 18:20:30 +0000", EXPECTED_FULL, pattern);
+@@ -287,8 +430,14 @@ class FlexibleDateTimeParserTest extends UnitTest {
+     }
+ 
+     @Test
++    void parse_EddMMMyyyyHmmssZ_Extra() {
++        testAllOffsets("Mon 04-Jan-2016 13:20:30", EXPECTED_FULL);
++        testAllOffsets("Monday 04-Jan-2016 13:20:30", EXPECTED_FULL);
++    }
++
++    @Test
+     void parse_EMMMdHHmmsszzzyyyy() {
+-        DateTimeFormatter pattern = DateTimeFormatter.ofPattern("[E[,][ ]]MMM d H:mm[:ss][ z] yyyy");
++        DateTimeFormatter pattern = DateTimeFormatter.ofPattern("[E[,][ ]]MMM d H:mm[:ss][ z] yyyy[ ][z][ ][Z][ ][Z]");
+         test("Mon Jan 04 18:20:30 GMT 2016", EXPECTED_FULL, pattern);
+         test("Mon Jan 04 13:20:30 EST 2016", EXPECTED_FULL, pattern);
+         test("Mon Jan 04 13:20 EST 2016", EXPECTED_NO_SECS, pattern);
+@@ -305,6 +454,14 @@ class FlexibleDateTimeParserTest extends UnitTest {
+     }
+ 
+     @Test
++    void parse_EMMMdHHmmsszzzyyyy_Extra() {
++        testAllOffsets("Mon Jan 04 13:20:30 EST 2016", EXPECTED_FULL);
++        testAllOffsets("Monday Jan 04 13:20:30 EST 2016", EXPECTED_FULL);
++        testAllOffsets("Monday January 04 13:20:30 EST 2016", EXPECTED_FULL);
++        testAllOffsets("Mon January 04 13:20:30 EST 2016", EXPECTED_FULL);
++    }
++
++    @Test
+     void parse_MdyyKmma() {
+         DateTimeFormatter pattern = DateTimeFormatter.ofPattern("M/d/yy[ ]K:mm[:ss][ ]a");
+         test("01/04/16 06:20 PM", EXPECTED_NO_SECS, pattern);
+@@ -319,7 +476,7 @@ class FlexibleDateTimeParserTest extends UnitTest {
+ 
+     @Test
+     void parse_MdyyHmmssaz() {
+-        DateTimeFormatter pattern = DateTimeFormatter.ofPattern("M/d/yy[ ]H:mm[:ss][ ][a][ ][z][ ][Z]");
++        DateTimeFormatter pattern = DateTimeFormatter.ofPattern("M/d/yy[ ]H:mm[:ss][ ][a][ ][z][ ][Z][ ][Z]");
+         test("01/04/16 18:20:30 GMT", EXPECTED_FULL, pattern);
+         test("1/4/16 18:20:30 GMT", EXPECTED_FULL, pattern);
+         test("01/04/16 18:20:30 PM +0000", EXPECTED_FULL, pattern);
+@@ -343,6 +500,75 @@ class FlexibleDateTimeParserTest extends UnitTest {
+     }
+ 
+     @Test
++    void parse_MdyyHmmssaz_Extra() {
++        testAllOffsets("01/04/16 13:20:30", EXPECTED_FULL);
++    }
++
++    @Test
++    void parse_MdyyyyKmma() {
++        DateTimeFormatter pattern = DateTimeFormatter.ofPattern("M/d/yyyy[ ]K:mm[:ss][ ]a");
++        test("01/04/2016 06:20 PM", EXPECTED_NO_SECS, pattern);
++        test("1/4/2016 6:20 PM", EXPECTED_NO_SECS, pattern);
++        test("01/04/2016 06:20:30 PM", EXPECTED_FULL, pattern);
++        test("1/4/2016 06:20:30 PM", EXPECTED_FULL, pattern);
++        test("01/04/2016 00:20 AM", EXPECTED_NO_HR_SEC, pattern);
++    }
++
++    @Test
++    void parse_MdyyyyHmmssaz() {
++        DateTimeFormatter pattern = DateTimeFormatter.ofPattern("M/d/yyyy[ ]H:mm[:ss][ ][a][ ][z][ ][Z][ ][Z]");
++        test("01/04/2016 18:20:30 GMT", EXPECTED_FULL, pattern);
++        test("1/4/2016 18:20:30 GMT", EXPECTED_FULL, pattern);
++        test("01/04/2016 18:20:30 PM +0000", EXPECTED_FULL, pattern);
++        test("1/4/2016 18:20:30 PM +0000", EXPECTED_FULL, pattern);
++        test("1/4/2016 8:20:30 AM -1000", EXPECTED_FULL, pattern);
++        test("1/4/2016 8:20:30 -1000", EXPECTED_FULL, pattern);
++        test("01/04/2016 18:20:30 PM GMT", EXPECTED_FULL, pattern);
++        test("1/4/2016 18:20:30 PM GMT", EXPECTED_FULL, pattern);
++        test("01/04/2016 18:20:30 PM GMT+0000", EXPECTED_FULL, pattern);
++        test("1/4/2016 18:20:30 PM GMT+0000", EXPECTED_FULL, pattern);
++        test("01/04/2016 18:20:30 PM", EXPECTED_FULL, pattern);
++        test("01/04/2016 18:20:30", EXPECTED_FULL, pattern);
++        test("01/04/2016 18:20", EXPECTED_NO_SECS, pattern);
++        test("1/4/2016 18:20", EXPECTED_NO_SECS, pattern);
++    }
++
++    @Test
++    void parse_MdyyyyHmmssaz_Extra() {
++        testAllOffsets("01/04/2016 13:20:30", EXPECTED_FULL);
++    }
++
++    @Test
++    void parse_dMyyyKmmssa() {
++        DateTimeFormatter pattern = DateTimeFormatter.ofPattern("d.M.yyyy[ ]K:mm[:ss][ ]a");
++        test("04.01.2016 06:20 PM", EXPECTED_NO_SECS, pattern);
++        test("04.01.2016 06:20PM", EXPECTED_NO_SECS, pattern);
++        test("04.01.2016 06:20:30 PM", EXPECTED_FULL, pattern);
++        test("04.01.2016 06:20:30PM", EXPECTED_FULL, pattern);
++        test("4.1.2016 6:20 PM", EXPECTED_NO_SECS, pattern);
++        test("4.1.2016 6:20PM", EXPECTED_NO_SECS, pattern);
++        test("4.1.2016 6:20:30 PM", EXPECTED_FULL, pattern);
++        test("4.1.2016 6:20:30PM", EXPECTED_FULL, pattern);
++    }
++
++    @Test
++    void parse_dMyyyHmmssaz() {
++        DateTimeFormatter pattern = DateTimeFormatter.ofPattern("d.M.yyyy[ ]H:mm[:ss][ ][a][ ][z][ ][Z][ ][Z]");
++        test("04.01.2016 18:20:30", EXPECTED_FULL, pattern);
++        test("4.1.2016 18:20:30", EXPECTED_FULL, pattern);
++        test("4.1.2016 18:20", EXPECTED_NO_SECS, pattern);
++        test("04.01.2016 18:20:30 +0000", EXPECTED_FULL, pattern);
++        test("04.01.2016 18:20:30 GMT+0000", EXPECTED_FULL, pattern);
++        test("04.01.2016 18:20:30 GMT", EXPECTED_FULL, pattern);
++        test("04.01.2016 18:20:30+0000", EXPECTED_FULL, pattern);
++    }
++
++    @Test
++    void parse_dMyyyHmmssaz_Extra() {
++        testAllOffsets("04.01.2016 13:20:30", EXPECTED_FULL);
++    }
++
++    @Test
+     void parse_HHmmddMMyyyy() {
+         DateTimeFormatter pattern = DateTimeFormatter.ofPattern("[HHmm]dd[-][.][/]MM[-][.][/]yyyy");
+         test("04-01-2016", EXPECTED_NO_TIME, pattern);
+@@ -353,7 +579,7 @@ class FlexibleDateTimeParserTest extends UnitTest {
+ 
+     @Test
+     void parse_yyyyMMddHHmmssS() {
+-        DateTimeFormatter pattern = DateTimeFormatter.ofPattern("yyyy/MM/dd[[ ]HH[:]mm[[:]ss[[.]S]][ ][z][ ][Z]]");
++        DateTimeFormatter pattern = DateTimeFormatter.ofPattern("yyyy/MM/dd[[ ]HH[:]mm[[:]ss[[.]S]][ ][z][ ][Z][ ][Z]]");
+         test("2016/01/04 18:20:30.0", EXPECTED_FULL, pattern);
+         test("2016/01/0418:20:30.0", EXPECTED_FULL, pattern);
+         test("2016/01/041820300", EXPECTED_FULL, pattern);
+@@ -370,8 +596,13 @@ class FlexibleDateTimeParserTest extends UnitTest {
+     }
+ 
+     @Test
++    void parse_yyyyMMddHHmmssS_Extra() {
++        testAllOffsets("2016/01/04 13:20:30", EXPECTED_FULL);
++    }
++
++    @Test
+     void parse_yyyy_MM_ddHHmmssS() {
+-        DateTimeFormatter pattern = DateTimeFormatter.ofPattern("yyyy:MM:dd[ H:m[:ss[.S]][ ][z][ ][Z]]");
++        DateTimeFormatter pattern = DateTimeFormatter.ofPattern("yyyy:MM:dd[ H:m[:ss[.S]][ ][z][ ][Z][ ][Z]]");
+         test("2016:01:04 18:20:30.0", EXPECTED_FULL, pattern);
+         test("2016:01:04 18:20:30", EXPECTED_FULL, pattern);
+         test("2016:01:04 18:20:30 +0000", EXPECTED_FULL, pattern);
+@@ -383,6 +614,11 @@ class FlexibleDateTimeParserTest extends UnitTest {
+     }
+ 
+     @Test
++    void parse_yyyy_MM_ddHHmmssS_Extra() {
++        testAllOffsets("2016:01:04 13:20:30.0", EXPECTED_FULL);
++    }
++
++    @Test
+     void parse_yyyyMMddHHmmss() {
+         DateTimeFormatter pattern = DateTimeFormatter.ofPattern("yyyyMMddHHmmss");
+         test("20160104182030", EXPECTED_FULL, pattern);
+@@ -425,6 +661,10 @@ class FlexibleDateTimeParserTest extends UnitTest {
+         test("2016-01-04\t\t18:20", EXPECTED_NO_SECS, "TABS");
+         test("2016-01-04        18:20", EXPECTED_NO_SECS, "SPACES");
+         test("2016-01-04 18:20=0D", EXPECTED_NO_SECS, "qp'ified ending");
++        test("$$2016-01-04 18:20:00$$", EXPECTED_NO_SECS, "Extra characters at the beginning and end");
++        test("2016-01-04 (18:20:00)", EXPECTED_NO_SECS, "Extra parenthesis");
++        test("2016-01-04 18:20:00 [GMT]", EXPECTED_NO_SECS, "Extra brackets");
++        test("\"Mon\", 4 Jan 2016 18:20 +0000 \"EST\"", EXPECTED_NO_SECS, "Extra quotes");
+     }
+ 
+     @Test
